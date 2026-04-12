@@ -1,0 +1,13 @@
+[package]
+name = "rust-snippets-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+rmcp = { version = "1.4.0", features = ["server"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+schemars = "1.2.1"
+serde = "1.0.228"
+tokio = { version = "1.42.0", features = ["full"] }
+dirs = "6.0.0"
