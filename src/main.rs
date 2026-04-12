@@ -130,6 +130,33 @@ impl MyServer {
             Ok(lines.join("\n"))
         }
     }
+
+    #[tool(description = "Fetch one snippet by ID, including its full code.")]
+    async fn get_snippet(&self, Parameters(args): Parameters<IdArgs>) -> Result<String, String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let result = db.query_row(
+            "SELECT title, language, code, tags FROM snippets WHERE id = ?1",
+            params![args.id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        );
+        match result {
+            Ok((title, lang, code, tags)) => Ok(format!(
+                "# {title}\nLanguage: {lang}\nTags: {}\n\n```{lang}\n{code}\n```",
+                tags.unwrap_or_default()
+            )),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(format!("No snippet with id {}", args.id))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 #[tool_handler(
