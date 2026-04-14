@@ -1,9 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{
+        ListResourcesResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ServerCapabilities, ServerInfo,
+    },
+    serde_json,
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use rusqlite::{Connection, params};
@@ -166,8 +171,118 @@ impl MyServer {
 )]
 impl ServerHandler for MyServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("myyyy server")
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .enable_resources_list_changed()
+                .build(),
+        )
+        .with_instructions("Personal snippets store")
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let mut stmt = db
+            .prepare("SELECT id, title, language FROM snippets ORDER BY id DESC")
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let title: String = row.get(1)?;
+                let language: String = row.get(2)?;
+                Ok((id, title, language))
+            })
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let resources: Vec<Resource> = rows
+            .filter_map(Result::ok)
+            .map(|(id, title, language)| {
+                Resource::new(
+                    RawResource {
+                        uri: format!("snippet://{id}"),
+                        name: title,
+                        title: None,
+                        description: Some(format!("{language} snippet #{id}")),
+                        mime_type: Some("text/plain".into()),
+                        size: None,
+                        icons: None,
+                        meta: None,
+                    },
+                    None,
+                )
+            })
+            .collect();
+
+        Ok(ListResourcesResult {
+            resources,
+            next_cursor: None,
+            ..Default::default()
+        })
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, ErrorData> {
+        let id = request
+            .uri
+            .strip_prefix("snippet://")
+            .and_then(|s| s.parse::<i64>().ok())
+            .ok_or_else(|| {
+                ErrorData::invalid_params(
+                    format!("URI must look like snippet://<id>, got {}", request.uri),
+                    None,
+                )
+            })?;
+
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let (title, language, code, tags) = db
+            .query_row(
+                "SELECT title, language, code, tags FROM snippets WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    ErrorData::invalid_params(format!("No snippet with id {id}"), None)
+                }
+                other => ErrorData::internal_error(other.to_string(), None),
+            })?;
+
+        let body = format!(
+            "# {title}\nLanguage: {language}\nTags: {}\n\n```{language}\n{code}\n```\n",
+            tags.unwrap_or_default()
+        );
+
+        let result: ReadResourceResult = serde_json::from_value(serde_json::json!({
+            "contents": [{
+                "uri": request.uri,
+                "text": body,
+            }]
+        }))
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        Ok(result)
     }
 }
 
