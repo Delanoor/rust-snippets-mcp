@@ -2,12 +2,13 @@ use std::sync::{Arc, Mutex};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::prompt::PromptRouter, tool::ToolRouter, wrapper::Parameters},
     model::{
-        ListResourcesResult, PaginatedRequestParams, RawResource, ReadResourceRequestParams,
-        ReadResourceResult, Resource, ServerCapabilities, ServerInfo,
+        GetPromptRequestParams, GetPromptResult, ListPromptsResult, ListResourcesResult,
+        PaginatedRequestParams, PromptMessage, PromptMessageRole, RawResource,
+        ReadResourceRequestParams, ReadResourceResult, Resource, ServerCapabilities, ServerInfo,
     },
-    serde_json,
+    prompt, prompt_handler, prompt_router, serde_json,
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
@@ -49,6 +50,62 @@ struct IdArgs {
 struct MyServer {
     tool_router: ToolRouter<Self>,
     db: Arc<Mutex<Connection>>,
+    prompt_router: PromptRouter<Self>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ReviewArgs {
+    /// The ID of the snippet to review.
+    id: i64,
+    /// Optional focus areas, e.g. "performance, idiom".
+    focus: Option<String>,
+}
+
+#[prompt_router]
+impl MyServer {
+    #[prompt(description = "Ask Claude to review a saved snippet.")]
+    async fn review_snippet(
+        &self,
+        Parameters(args): Parameters<ReviewArgs>,
+    ) -> Result<GetPromptResult, ErrorData> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+        let (title, language, code) = db
+            .query_row(
+                "SELECT title, language, code FROM snippets WHERE id = ?1",
+                rusqlite::params![args.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let focus = args
+            .focus
+            .unwrap_or_else(|| "correctness, idiom, and clarity".into());
+
+        Ok(GetPromptResult::new(vec![
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                format!(
+                    "You are a {language} code reviewer. Focus on: {focus}. \
+Call out bugs, non-idiomatic patterns, and concrete improvements. \
+Be specific — reference line content, not line numbers."
+                ),
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!("Review this snippet titled \"{title}\":\n\n```{language}\n{code}\n```"),
+            ),
+        ])
+        .with_description(format!("Review of snippet #{}: {title}", args.id)))
+    }
 }
 
 #[tool_router]
@@ -68,8 +125,10 @@ impl MyServer {
         Ok(Self {
             tool_router: Self::tool_router(),
             db: Arc::new(Mutex::new(db)),
+            prompt_router: Self::prompt_router(),
         })
     }
+
     #[tool(description = "Meow")]
     async fn meow(&self) -> String {
         String::from("meow")
@@ -163,7 +222,7 @@ impl MyServer {
         }
     }
 }
-
+#[prompt_handler]
 #[tool_handler(
     name = "my server",
     version = "1.0.0",
@@ -176,6 +235,7 @@ impl ServerHandler for MyServer {
                 .enable_tools()
                 .enable_resources()
                 .enable_resources_list_changed()
+                .enable_prompts()
                 .build(),
         )
         .with_instructions("Personal snippets store")
